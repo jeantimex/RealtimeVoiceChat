@@ -213,7 +213,13 @@ class TurnDetection:
         )
         self.text_worker.start()
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Prefer CUDA > MPS (Apple Silicon) > CPU
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
         logger.info(f"🎤🔌 Using device: {self.device}")
         self.tokenizer = transformers.DistilBertTokenizerFast.from_pretrained(model_dir)
         self.classification_model = transformers.DistilBertForSequenceClassification.from_pretrained(model_dir)

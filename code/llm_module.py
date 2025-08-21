@@ -181,6 +181,105 @@ def _run_ollama_ps():
         logger.error(f"🤖💥 An unexpected error occurred while running 'ollama ps': {e}")
         return False
 
+def _check_ollama_model_exists(model_name: str) -> bool:
+    """
+    Check if a model exists in the local Ollama installation.
+    
+    Args:
+        model_name: The name of the model to check
+        
+    Returns:
+        True if the model exists, False otherwise
+    """
+    try:
+        result = subprocess.run(["ollama", "list"], check=True, capture_output=True, text=True, timeout=10.0)
+        # Parse the output to check if model exists
+        lines = result.stdout.strip().split('\n')
+        for line in lines[1:]:  # Skip header line
+            if line.strip() and model_name in line.split()[0]:
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"🤖💥 Error checking if model {model_name} exists: {e}")
+        return False
+
+def _download_ollama_model_with_progress(model_name: str) -> bool:
+    """
+    Download an Ollama model with progress display.
+    
+    Args:
+        model_name: The name of the model to download
+        
+    Returns:
+        True if download was successful, False otherwise
+    """
+    import threading
+    import time
+    
+    logger.info(f"🤖⬇️ Model '{model_name}' not found locally. Starting download...")
+    
+    # Start the download process
+    try:
+        process = subprocess.Popen(
+            ["ollama", "pull", model_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+        
+        # Show progress
+        print(f"\n🤖⬇️ Downloading {model_name}...")
+        
+        # Read output line by line and show progress
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                line = output.strip()
+                # Show progress for download lines
+                if "pulling" in line.lower() or "%" in line or "MB" in line or "GB" in line:
+                    print(f"    {line}")
+                elif "success" in line.lower():
+                    print(f"    ✅ {line}")
+        
+        # Wait for process to complete
+        return_code = process.poll()
+        
+        if return_code == 0:
+            logger.info(f"🤖✅ Successfully downloaded model '{model_name}'")
+            print(f"🤖✅ Model '{model_name}' download complete!\n")
+            return True
+        else:
+            logger.error(f"🤖💥 Failed to download model '{model_name}' (exit code: {return_code})")
+            return False
+            
+    except Exception as e:
+        logger.error(f"🤖💥 Error downloading model {model_name}: {e}")
+        return False
+
+def ensure_ollama_model_available(model_name: str) -> bool:
+    """
+    Ensure an Ollama model is available, downloading it if necessary.
+    
+    Args:
+        model_name: The name of the model to ensure is available
+        
+    Returns:
+        True if the model is available (either was already present or successfully downloaded),
+        False if the model could not be made available
+    """
+    # First check if model already exists
+    if _check_ollama_model_exists(model_name):
+        logger.info(f"🤖✅ Model '{model_name}' found locally")
+        return True
+    
+    # Model doesn't exist, try to download it
+    logger.info(f"🤖⬇️ Model '{model_name}' not found, attempting to download...")
+    return _download_ollama_model_with_progress(model_name)
+
 # --- LLM Class ---
 class LLM:
     """
@@ -216,7 +315,7 @@ class LLM:
             ValueError: If an unsupported backend is specified.
             ImportError: If required libraries for the selected backend are not installed.
         """
-        logger.info(f"🤖⚙️ Initializing LLM with backend: {backend}, model: {model}, system_prompt: {system_prompt}")
+        logger.info(f"🤖⚙️ Initializing LLM with backend: {backend}, model: {model}")
         self.backend = backend.lower()
         if self.backend not in self.SUPPORTED_BACKENDS:
             raise ValueError(f"Unsupported backend '{backend}'. Supported: {self.SUPPORTED_BACKENDS}")
@@ -263,6 +362,12 @@ class LLM:
         if self.system_prompt:
             self.system_prompt_message = {"role": "system", "content": self.system_prompt}
             logger.info(f"🤖💬 System prompt set.")
+        
+        # For Ollama backend, ensure the model is available locally
+        if self.backend == "ollama":
+            if not ensure_ollama_model_available(self.model):
+                logger.error(f"🤖💥 Failed to ensure model '{self.model}' is available. LLM initialization may fail.")
+                # Don't raise exception here, let the connection attempt show the specific error
 
     def _lazy_initialize_clients(self) -> bool:
         """

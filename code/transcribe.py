@@ -14,7 +14,16 @@ import json
 import copy
 import time
 import re
+import queue
 from typing import Optional, Callable, Any, Dict, List
+
+# Import wake word detection functionality
+try:
+    from wake_word_detector import WakeWordDetector, OPENWAKEWORD_AVAILABLE
+except ImportError:
+    logger.warning("👂⚠️ Wake word detector module not available")
+    WakeWordDetector = None
+    OPENWAKEWORD_AVAILABLE = False
 
 # --- Configuration Flags ---
 USE_TURN_DETECTION = True
@@ -42,8 +51,8 @@ DEFAULT_RECORDER_CONFIG: Dict[str, Any] = {
     "beam_size": 3,
     "beam_size_realtime": 3,
     "no_log_file": True,
-    "wake_words": "jarvis",
-    "wakeword_backend": "pvporcupine",
+    "use_wake_words": True,  # Enable wake word detection
+    "wake_words": "jarvis",  # Wake words to detect
     "allowed_latency_limit": 500,
     # Callbacks will be added dynamically in _create_recorder
     "debug_mode": True,
@@ -63,6 +72,7 @@ if USE_TURN_DETECTION:
 
 INT16_MAX_ABS_VALUE: float = 32768.0
 SAMPLE_RATE: int = 16000
+
 
 
 class TranscriptionProcessor:
@@ -162,6 +172,27 @@ class TranscriptionProcessor:
         self.recorder_config = copy.deepcopy(recorder_config if recorder_config else DEFAULT_RECORDER_CONFIG)
         self.recorder_config['language'] = self.source_language # Ensure language is set
 
+        # Initialize wake word detection if configured
+        self.wake_word_detector = None
+        self.wake_word_enabled = False
+        self.wake_word_detected = False
+        self.use_wake_words = self.recorder_config.get('use_wake_words', False)
+        
+        if self.use_wake_words and OPENWAKEWORD_AVAILABLE:
+            wake_words = self.recorder_config.get('wake_words', 'jarvis')
+            if isinstance(wake_words, str):
+                wake_words = [wake_words]
+            
+            self.wake_word_detector = WakeWordDetector(
+                wake_words=wake_words,
+                threshold=0.5,
+                on_wake_word_detected=self._on_wake_word_detected
+            )
+            self.wake_word_enabled = True
+            logger.info(f"👂🔊 Wake word detection enabled for: {wake_words}")
+        elif self.use_wake_words:
+            logger.warning("👂⚠️ Wake words requested but OpenWakeWord not available")
+
         if USE_TURN_DETECTION:
             logger.info(f"👂🔄 {Colors.YELLOW}Turn detection enabled{Colors.RESET}")
             self.turn_detection = TurnDetection(
@@ -170,8 +201,28 @@ class TranscriptionProcessor:
                 pipeline_latency=pipeline_latency
             )
 
-        self._create_recorder()
+        # Defer recorder creation to avoid blocking server startup
+        # self._create_recorder()
         self._start_silence_monitor()
+        
+        # Start wake word detection if enabled
+        if self.wake_word_enabled and self.wake_word_detector:
+            self.wake_word_detector.start()
+
+    def _on_wake_word_detected(self, wake_word: str):
+        """Callback when wake word is detected."""
+        logger.info(f"👂🎯 Wake word '{wake_word}' detected!")
+        self.wake_word_detected = True
+        
+        # Optional: Call user callback for wake word detection
+        if hasattr(self, 'on_wakeword_detection_start') and self.on_wakeword_detection_start:
+            self.on_wakeword_detection_start()
+
+    def reset_wake_word_state(self):
+        """Reset the wake word detection state (e.g., after processing a request)."""
+        if self.wake_word_enabled:
+            self.wake_word_detected = False
+            logger.debug("👂🔄 Wake word state reset - waiting for next wake word")
 
     # --- Recorder Parameter Abstraction ---
 
@@ -330,7 +381,7 @@ class TranscriptionProcessor:
             waiting_time: The new calculated silence duration in seconds.
             text: The text used by TurnDetection to calculate the waiting time (for logging).
         """
-        if self.recorder:
+        if self._ensure_recorder_initialized() and self.recorder:
             current_duration = self._get_recorder_param("post_speech_silence_duration")
             if current_duration != waiting_time:
                 log_text = text if text else "(No text provided)"
@@ -362,7 +413,7 @@ class TranscriptionProcessor:
             if self.full_transcription_callback:
                 self.full_transcription_callback(text)
 
-        if self.recorder:
+        if self._ensure_recorder_initialized() and self.recorder:
             # The specific method might differ between client/local STT versions
             # Assuming a common 'text' method exists or is adapted
             if hasattr(self.recorder, 'text'):
@@ -404,7 +455,7 @@ class TranscriptionProcessor:
             audio_bytes: Optional audio data (currently unused in this method's logic
                          but kept for potential future use or API consistency).
         """
-        if self.recorder: # Check if recorder exists, primarily as a gatekeeper
+        if self._ensure_recorder_initialized() and self.recorder: # Check if recorder exists, primarily as a gatekeeper
             if self.realtime_text is None:
                 logger.warning(f"👂❓ {Colors.RED}Forcing final transcription, but realtime_text is None. Using empty string.{Colors.RESET}")
                 current_text = ""
@@ -759,17 +810,19 @@ class TranscriptionProcessor:
 
         # --- Instantiate Recorder ---
         try:
+            # Remove parameters that AudioToTextRecorder doesn't accept or that cause issues
+            recorder_config = active_config.copy()
+            recorder_config.pop("use_wake_words", None)  # Remove if present
+            recorder_config.pop("wake_words", None)      # Remove wake words
+            recorder_config.pop("wakeword_backend", None) # Remove wake word backend
+            
             if START_STT_SERVER:
                 # Note: The client might use different callback names, adjust if needed
                 # For now, assume it might accept the same or handle internally
-                self.recorder = AudioToTextRecorderClient(**active_config)
-                # Ensure wake words are disabled if needed (can also be done via config dict)
-                self._set_recorder_param("use_wake_words", False)
+                self.recorder = AudioToTextRecorderClient(**recorder_config)
             else:
-                # Instantiate the LOCAL recorder with the corrected active_config
-                self.recorder = AudioToTextRecorder(**active_config)
-                # Ensure wake words are disabled if needed (double check via param setting)
-                self._set_recorder_param("use_wake_words", False) # Uses the helper method
+                # Instantiate the LOCAL recorder with the corrected recorder_config
+                self.recorder = AudioToTextRecorder(**recorder_config)
 
             logger.info(f"👂✅ {recorder_type} instance created successfully.")
 
@@ -777,6 +830,15 @@ class TranscriptionProcessor:
             # Log the exception with traceback for detailed debugging
             logger.exception(f"👂🔥 Failed to create recorder: {e}")
             self.recorder = None # Ensure recorder is None if creation failed
+
+    def _ensure_recorder_initialized(self) -> bool:
+        """
+        Lazy initialization of the recorder. Returns True if successful.
+        """
+        if self.recorder is None:
+            logger.info("👂🔄 Lazy initializing recorder...")
+            self._create_recorder()
+        return self.recorder is not None
 
     def feed_audio(self, chunk: bytes, audio_meta_data: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -787,7 +849,29 @@ class TranscriptionProcessor:
             audio_meta_data: Optional dictionary containing metadata about the audio
                              (e.g., sample rate, channels), if required by the recorder.
         """
-        if self.recorder and not self.shutdown_performed:
+        if self.shutdown_performed:
+            logger.debug("👂🚫 Cannot feed audio: Shutdown already performed.")
+            return
+            
+        # Convert audio chunk to numpy array for wake word detection
+        if self.wake_word_enabled and self.wake_word_detector:
+            try:
+                # Convert bytes to numpy array (assuming 16-bit PCM)
+                audio_array = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / INT16_MAX_ABS_VALUE
+                self.wake_word_detector.feed_audio(audio_array)
+            except Exception as e:
+                logger.error(f"👂💥 Error feeding audio to wake word detector: {e}")
+        
+        # If wake words are enabled but not detected yet, skip STT processing
+        if self.wake_word_enabled and not self.wake_word_detected:
+            logger.debug("👂⏳ Waiting for wake word before processing STT...")
+            return
+            
+        if not self._ensure_recorder_initialized():
+            logger.warning("👂⚠️ Cannot feed audio: Recorder initialization failed")
+            return
+            
+        if self.recorder:
             try:
                 # Check if feed_audio expects metadata and provide if available
                 if START_STT_SERVER:
@@ -800,11 +884,8 @@ class TranscriptionProcessor:
                 logger.debug(f"👂🔊 Fed audio chunk of size {len(chunk)} bytes to recorder.")
             except Exception as e:
                 logger.error(f"👂💥 Error feeding audio to recorder: {e}")
-        elif not self.recorder:
+        else:
             logger.warning("👂⚠️ Cannot feed audio: Recorder not initialized.")
-        elif self.shutdown_performed:
-            logger.debug("👂🚫 Cannot feed audio: Shutdown already performed.")
-        # No warning if shutdown_performed is True, as expected
 
     def shutdown(self) -> None:
         """
@@ -815,7 +896,7 @@ class TranscriptionProcessor:
             logger.info("👂🔌 Shutting down TranscriptionProcessor...")
             self.shutdown_performed = True # Set flag early to stop loops/threads
 
-            if self.recorder:
+            if self._ensure_recorder_initialized() and self.recorder:
                 logger.info("👂🔌 Calling recorder shutdown()...")
                 try:
                     self.recorder.shutdown()
@@ -834,6 +915,14 @@ class TranscriptionProcessor:
                     self.turn_detection.shutdown() # Example: Assuming TurnDetection has a shutdown method
                 except Exception as e:
                      logger.error(f"👂💥 Error during TurnDetection shutdown: {e}", exc_info=True)
+            
+            # Shutdown wake word detector
+            if self.wake_word_enabled and self.wake_word_detector:
+                logger.info("👂🔌 Shutting down wake word detector...")
+                try:
+                    self.wake_word_detector.stop()
+                except Exception as e:
+                    logger.error(f"👂💥 Error during wake word detector shutdown: {e}", exc_info=True)
 
             logger.info("👂🔌 TranscriptionProcessor shutdown process finished.")
         else:

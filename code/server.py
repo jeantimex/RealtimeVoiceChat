@@ -30,7 +30,6 @@ from starlette.responses import HTMLResponse, Response, FileResponse
 USE_SSL = False
 TTS_START_ENGINE = "orpheus"
 TTS_START_ENGINE = "kokoro"
-# TTS_START_ENGINE = "coqui"
 TTS_ORPHEUS_MODEL = "Orpheus_3B-1BaseGGUF/mOrpheus_3B-1Base_Q4_K_M.gguf"
 TTS_ORPHEUS_MODEL = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf"
 

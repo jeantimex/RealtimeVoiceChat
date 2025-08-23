@@ -51,7 +51,7 @@ DEFAULT_RECORDER_CONFIG: Dict[str, Any] = {
     "beam_size": 3,
     "beam_size_realtime": 3,
     "no_log_file": True,
-    "use_wake_words": True,  # Enable wake word detection
+    "use_wake_words": False,  # Enable wake word detection
     "wake_words": "jarvis",  # Wake words to detect
     "allowed_latency_limit": 500,
     # Callbacks will be added dynamically in _create_recorder
